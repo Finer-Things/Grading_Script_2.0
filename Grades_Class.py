@@ -90,7 +90,7 @@ class Grades:
         else:
             self.egrades_roster_df = pd.read_csv(file_name)
             self.egrades_roster_df.rename(columns = {"Perm #": "SID"}, inplace = True)
-            self.egrades_roster_df = self.egrades_roster_df[["SID", "Enrl Cd"]]
+            self.egrades_roster_df = self.egrades_roster_df[["SID", "Enrl Cd", "Email"]]
 
     def get_webwork_df(self, file_name = None, webwork_total_col_name = None, course_host = "Canvas"):
         if file_name == None:
@@ -102,6 +102,9 @@ class Grades:
         else:
             self.webwork_df = pd.read_csv(self.webwork_file_name)
         
+        if course_host in [None, "Canvas"]:
+            self.webwork_df.rename(columns={col_name:"SID" for col_name in self.webwork_df if "login ID" in col_name})
+        
         #Renaming ID Columns
         if course_host == "Gauchospace":            
             #Renameing "Perm #" to "SID" in Egrades, then pruning it to almost nothing
@@ -109,21 +112,41 @@ class Grades:
             self.webwork_df = self.webwork_df[["SID", "Homework"]]
             self.webwork_df["Homework"] = self.webwork_df.apply(lambda row: float(str(row["Homework"]).strip("%")), axis=1)
             self.webwork_df["Homework - Max Points"] = 100
-        elif course_host == "Canvas":
-            pass
+        elif course_host in [None, "Canvas"]:
+            self.webwork_df.columns = self.webwork_df.columns.str.strip()
+            self.webwork_df.rename(columns = {self.webwork_df.columns[0]: "Email", r"%score": "Homework"}, inplace = True)
+            self.webwork_df = self.webwork_df[["Email", "Homework"]]
+            # The next command strips the spaces out of the columns and returns only the login ID (before the @ symbol in the email address)
+            self.webwork_df["Email"] = self.webwork_df["Email"].apply(lambda entry: entry.strip().split("@")[0])
+            self.webwork_df["Homework"] = self.webwork_df["Homework"].apply(lambda entry: float(entry)/.9)
 
 
         
     def get_all_grading_data(self, course_host = "Canvas", webwork_total_col_name = None):
-        if self.gradescope_file_name != None:
-            self.get_gradescope_df(course_host = course_host)
-            self.grades = self.gradescope_df
-            if self.egrades_roster_file_name != None:
-                self.get_egrades_roster_df()
-                self.grades = pd.merge(self.gradescope_df, self.egrades_roster_df, on="SID", how ="right")
+        if course_host in [None, "Canvas"]:
+            # This still merges files separately, NOT through Canvas. But the merging is on "Email", which I trunkated because egrades and canvas can't get the students' emails straight! 
+            if self.gradescope_file_name != None:
+                self.get_gradescope_df(course_host = course_host)
+                self.grades = self.gradescope_df
+                self.grades["Email"] = self.grades["Email"].apply(lambda entry: entry.split("@")[0])
+                if self.egrades_roster_file_name != None:
+                    self.get_egrades_roster_df()
+                    self.egrades_roster_df["Email"] = self.egrades_roster_df["Email"].apply(lambda entry: entry.split("@")[0])
+                    self.grades = pd.merge(self.gradescope_df, self.egrades_roster_df, on="Email", how ="right")
                 if self.webwork_file_name != None:
                     self.get_webwork_df(course_host = course_host, webwork_total_col_name = webwork_total_col_name)
-                    self.grades = pd.merge(self.grades, self.webwork_df, on="SID", how ="left")
+                    self.grades = pd.merge(self.grades, self.webwork_df, on="Email", how ="left")
+        
+        if course_host == "Gauchospace":
+            if self.gradescope_file_name != None:
+                self.get_gradescope_df(course_host = course_host)
+                self.grades = self.gradescope_df
+                if self.egrades_roster_file_name != None:
+                    self.get_egrades_roster_df()
+                    self.grades = pd.merge(self.gradescope_df, self.egrades_roster_df, on="SID", how ="right")
+                    if self.webwork_file_name != None:
+                        self.get_webwork_df(course_host = course_host, webwork_total_col_name = webwork_total_col_name)
+                        self.grades = pd.merge(self.grades, self.webwork_df, on="SID", how ="left")
         
         self.set_max_points()
         self.set_grade_items_by_category()
@@ -168,6 +191,8 @@ class Grades:
         max_points_column_names = [name for name in df.columns if "Max Points" in name]
         part_to_chop = len(" - Max Points")
         self.max_points_function = {name[:-part_to_chop]: df[name].iloc[1] for name in max_points_column_names}
+        if self.webwork_file_name != None:
+            self.max_points_function["Homework"] = 100
     
     def create_total_columns(self, category_dictionary = None, df = None):
         if category_dictionary == None:
@@ -180,22 +205,27 @@ class Grades:
             raise Exception(f"This is a list of grade items with lowest items dropped that have not been normalized. \n {checklist} \n It should be empty.")
         for (grade_category, tuple) in self.grade_category_dictionary.items():
             normalize_condition = tuple[1]
-            d = tuple[2]# number dropped
+            d = tuple[2]# number of items dropped
             if normalize_condition:
                 for grade_item_name in self.grade_items_by_category[grade_category]:
                     df[grade_item_name] *= 100/self.max_points_function[grade_item_name]
                     self.max_points_function[grade_item_name] = 100
 
-            # What I've used to make this work without issue is normalizing everything before I drop the lowest. See the grade_categories_to_normalize list above. 
-            df[f"{grade_category} Total"] = df[self.grade_items_by_category[grade_category]].apply(lambda row: sum(sorted(row.fillna(0))[d:]), axis=1)
-            self.max_points_function[f"{grade_category} Total"] = sum(sorted([self.max_points_function[item] for item in self.grade_items_by_category[grade_category]])[d:])
+            # Control flow below ensures empty categories have a zero total. When grade columns are created, these will not be factored into grade calculations. 
+            if self.num_grade_items_by_category[grade_category] > 0:
+                # What I've used to make this work without issue is normalizing everything before I drop the lowest. See the grade_categories_to_normalize list above. 
+                df[f"{grade_category} Total"] = df[self.grade_items_by_category[grade_category]].apply(lambda row: sum(sorted(row.fillna(0))[d:]), axis=1)
+                print()
+                self.max_points_function[f"{grade_category} Total"] = sum(sorted([self.max_points_function[item] for item in self.grade_items_by_category[grade_category]])[d:])
+                
+                # Normalizing the Totals
+                df[f"{grade_category} Total"] *= 100/self.max_points_function[f"{grade_category} Total"]
+                self.max_points_function[f"{grade_category} Total"] = 100
+                #Rounding to Two Decimal Places
+                df[f"{grade_category} Total"] = df[f"{grade_category} Total"].apply(np.round, decimals=2)
+            else:
+                df[f"{grade_category} Total"] = 0
             
-            # Normalizing the Totals
-            df[f"{grade_category} Total"] *= 100/self.max_points_function[f"{grade_category} Total"]
-            self.max_points_function[f"{grade_category} Total"] = 100
-            #Rounding to Two Decimal Places
-            df[f"{grade_category} Total"] = df[f"{grade_category} Total"].apply(np.round, decimals=2)
-        
         
     def create_grade_columns(self, great_effort_rule = None, final_condition = None):
         if great_effort_rule == None:
@@ -204,11 +234,16 @@ class Grades:
             final_condition = self.final_condition
 
         def grade_calculator(row):
-            return sum([row[category + " Total"]*item[0] for (category, item) in self.grade_category_dictionary.items()])/sum([item[0] for item in self.grade_category_dictionary.values()])
+            # for (category, data) in self.grade_category_dictionary.items():
+            #     if self.num_grade_items_by_category[category] > 0:
+            #         print(category, data, data[0])
+            return sum([row[category + " Total"]*data[0] for (category, data) in self.grade_category_dictionary.items()])/sum([data[0] for (category, data) in self.grade_category_dictionary.items() if self.num_grade_items_by_category[category] > 0])
+            
         self.grades["Grade"] = self.grades.apply(grade_calculator , axis=1).apply(np.round, decimals=2)
         self.grades["Letter Grade"] = self.grades.apply(lambda row: letter_grade_assigner(row, final_condition = final_condition, great_effort_rule = great_effort_rule), axis=1)
+        self.max_points_function["Grade"] = 100
 
-    def letter_grade_assigner(row, final_condition = None, great_effort_rule = False, grade_column_name = "Grade", final_grade_column_name = "Final"):
+    def letter_grade_assigner(row, final_condition = None, great_effort_rule = False, grade_column_name = "Grade", final_grade_column_name = "Final Total"):
         """
         This letter grade assigner takes a raw grade percentage and outputs a letter grade. There are two peculiarities to this function that are not in a standard letter grade assigner: 
         1) Math 34A/B have a tradition of grading with a "Great Effort Rule" that assigns a B to students who earn a C or better through raw score if they took most of the quizzes, came to lecture and completed at 
@@ -303,6 +338,41 @@ class Grades:
             for item in print_list:
                 print(f"{str(item)[:10]:13}|", end="")
             print("")
+    
+    
+    def plot_letter_grades(self, 
+                           df=None, 
+                           grade_category_to_separate_by = None,
+                           savefig = False
+                    ):
+        if df == None:
+            df=self.grades
+        df = df.copy()
+        df["Letter Grade Letter"] = df["Letter Grade"].apply(lambda string: string.strip("+-"))
+        df["Letter Grade +/-"] = df["Letter Grade"].apply(lambda string: string.strip("ABCDF"))
+        if grade_category_to_separate_by != None:
+            df["Letter Grade +/-"] = df.apply(lambda row: f"No {grade_category_to_separate_by}" if (all([math.isnan(row[assignment]) for assignment in self.grade_items_by_category[grade_category_to_separate_by]])) else row["Letter Grade +/-"], axis = 1)
+            # Scratch Work for modifying the code above:
+            #### We want the "apply" condition above to be something like math.isnan applied to every entry in self.grade_items_by_category[grade_category_to_separate_by]
+            # all([math.isnan(row[assignment]) for assignment in self.grade_items_by_category[grade_category_to_separate_by]])
+        df = df.sort_values("Letter Grade Letter", ascending = False)
+
+        plt.figure(figsize = (12,6))
+        mpl.rcParams['text.color'] = "navy"
+        sns.histplot(data = df, 
+                x = "Letter Grade Letter", 
+                hue = "Letter Grade +/-", 
+                hue_order = ["-", "", "+", f"No {grade_category_to_separate_by}"], 
+                palette = ["r", "b", "gold", "k"], 
+                multiple="stack"
+                ).set(title = f"{self.quarter_name} {self.course_name} Letter Grades" 
+                                            # xlabel = f'nm = No {grade_category_to_separate_by}(s) Taken'
+                                            )
+        if savefig == True:
+            plt.savefig(f"images/{self.quarter_name} {self.course_name} Letter Grades.png", bbox_inches = "tight")
+        plt.show()
+        plt.close()
+    
     
     def show_me_the_colors(self, include_xkcd = False):
         from matplotlib.patches import Rectangle
